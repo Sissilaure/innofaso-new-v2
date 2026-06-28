@@ -334,8 +334,9 @@ function buildEnvironmentSheet(wb, env, group, axis) {
   }
 
   if (fixed.length > 0) {
-    for (const chunk of chunkSeries(fixed, 5)) {
-      const dataUrl = renderEbChartPng(chunk, seuil);
+    for (const [ci, chunk] of chunkSeries(fixed, 5).entries()) {
+      const title = `EB E${env} — points ${ci * 5 + 1} à ${ci * 5 + chunk.length} (seuil ${seuil} UFC/cm²)`;
+      const dataUrl = renderEbChartExcelPng(chunk, seuil, title);
       embedImage(wb, ws, dataUrl, row, 0, EB_CHART_W, EB_CHART_H);
       row += EB_CHART_ROW_SPAN;
     }
@@ -375,6 +376,246 @@ function buildEnvironmentSheet(wb, env, group, axis) {
 // ── Feuille "Feuil1" : synthèse hebdomadaire du taux de conformité ──────
 // Colonnes Eau/Air gardées à zéro (fidélité visuelle au fichier de
 // référence) — l'application ne fait que des prélèvements de surface.
+// ── Graphique PNG du taux de conformité hebdomadaire (pour Feuil1) ───────
+// Fond blanc, style proche du fichier de référence InnoFaso (EB & Salmo).
+function drawConformityChart(canvas, weekData) {
+  canvas.width  = canvas.parentElement.clientWidth;
+  canvas.height = canvas.parentElement.clientHeight;
+  const ctx = canvas.getContext("2d");
+  const cw = canvas.width, ch = canvas.height;
+  const pad = { top: 32, right: 24, bottom: 40, left: 56 };
+  const W = cw - pad.left - pad.right;
+  const H = ch - pad.top - pad.bottom;
+
+  // Fond blanc
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, cw, ch);
+
+  // Titre
+  ctx.fillStyle = "#1f2937";
+  ctx.font = "bold 13px Arial, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("Taux de conformité hebdomadaire — Toutes zones", cw / 2, 20);
+
+  const withData = weekData.filter(d => d.total > 0);
+  if (withData.length === 0) {
+    ctx.fillStyle = "#9ca3af";
+    ctx.font = "12px Arial, sans-serif";
+    ctx.fillText("Aucune donnée disponible", cw / 2, ch / 2);
+    return;
+  }
+
+  const weeks  = withData.map(d => d.week);
+  const values = withData.map(d => d.rate);
+  const xMin = Math.min(...weeks), xMax = Math.max(...weeks);
+  const single = xMin === xMax;
+  const xPix = (w) => single ? pad.left + W / 2 : pad.left + ((w - xMin) / (xMax - xMin)) * W;
+  const yPix = (v) => pad.top + H * (1 - v);  // v déjà en 0-1
+
+  // Grilles Y (0%, 25%, 50%, 75%, 100%)
+  [0, 0.25, 0.5, 0.75, 1].forEach(t => {
+    const y = pad.top + H * (1 - t);
+    ctx.strokeStyle = t === 1 ? "#d1d5db" : "#f3f4f6";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + W, y); ctx.stroke();
+    ctx.fillStyle = "#6b7280";
+    ctx.font = "10px Arial, sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText(Math.round(t * 100) + "%", pad.left - 6, y + 3);
+  });
+
+  // Axe X — labels semaines
+  ctx.fillStyle = "#6b7280";
+  ctx.font = "10px Arial, sans-serif";
+  ctx.textAlign = "center";
+  const step = Math.max(1, Math.ceil(weeks.length / 10));
+  weeks.forEach((w, i) => {
+    if (i % step === 0) ctx.fillText("S" + w, xPix(w), pad.top + H + 18);
+  });
+
+  // Zone verte cible (≥ 95%)
+  const targetY = yPix(0.95);
+  ctx.fillStyle = "rgba(16,185,129,0.07)";
+  ctx.fillRect(pad.left, pad.top, W, targetY - pad.top);
+
+  // Ligne cible 100%
+  ctx.setLineDash([5, 4]);
+  ctx.strokeStyle = "#10b981";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(pad.left, pad.top); ctx.lineTo(pad.left + W, pad.top); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#10b981";
+  ctx.font = "9px Arial, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("Objectif 100%", pad.left + 4, pad.top - 4);
+
+  // Aire sous la courbe
+  const pix = withData.map(d => ({ x: xPix(d.week), y: yPix(d.rate) }));
+  if (pix.length > 1) {
+    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + H);
+    grad.addColorStop(0, "rgba(59,130,246,0.25)");
+    grad.addColorStop(1, "rgba(59,130,246,0.02)");
+    ctx.beginPath();
+    pix.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+    ctx.lineTo(pix[pix.length - 1].x, pad.top + H);
+    ctx.lineTo(pix[0].x, pad.top + H);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Courbe principale
+    ctx.beginPath();
+    pix.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+    ctx.strokeStyle = "#2563eb";
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = "round";
+    ctx.stroke();
+  }
+
+  // Points
+  pix.forEach((p, i) => {
+    const rate = withData[i].rate;
+    const color = rate >= 0.95 ? "#10b981" : rate >= 0.8 ? "#f59e0b" : "#ef4444";
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  });
+}
+
+function renderConformityChartPng(weekData, width, height) {
+  return renderPngDataUrl(width, height, (canvas) => drawConformityChart(canvas, weekData));
+}
+
+// ── Graphique PNG EB amélioré (fond blanc, style référence InnoFaso) ──────
+// Remplace drawChart (fond semi-transparent) par un rendu adapté à l'Excel :
+// fond blanc, couleurs plus proches du fichier VF novembre 2025.
+function drawEbChartForExcel(canvas, series, seuil, title) {
+  canvas.width  = canvas.parentElement.clientWidth;
+  canvas.height = canvas.parentElement.clientHeight;
+  const ctx = canvas.getContext("2d");
+  const cw = canvas.width, ch = canvas.height;
+  const pad = { top: 36, right: 20, bottom: 36, left: 50 };
+  const W = cw - pad.left - pad.right;
+  const H = ch - pad.top - pad.bottom;
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, cw, ch);
+
+  if (title) {
+    ctx.fillStyle = "#1f2937";
+    ctx.font = "bold 12px Arial, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(title, cw / 2, 22);
+  }
+
+  const allPoints = series.flatMap(s => s.points || []).filter(p => p.ufc != null);
+  if (allPoints.length === 0) {
+    ctx.fillStyle = "#9ca3af";
+    ctx.font = "11px Arial, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Aucune donnée", cw / 2, ch / 2);
+    return;
+  }
+
+  const allUfc = allPoints.map(p => p.ufc);
+  const maxVal = Math.max(...allUfc, seuil ?? 0, 10) * 1.15;
+  const times  = allPoints.map(p => new Date(p.date).getTime());
+  const xMin = Math.min(...times), xMax = Math.max(...times);
+  const single = xMax === xMin;
+  const xPix = (t) => single ? pad.left + W / 2 : pad.left + ((t - xMin) / (xMax - xMin)) * W;
+  const yPix = (v) => pad.top + H * (1 - v / maxVal);
+
+  // Grille
+  [0, 0.25, 0.5, 0.75, 1].forEach(t => {
+    const y = pad.top + H * (1 - t);
+    ctx.strokeStyle = t === 0 ? "#d1d5db" : "#f3f4f6";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + W, y); ctx.stroke();
+    ctx.fillStyle = "#6b7280";
+    ctx.font = "9px Arial, sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText(Math.round(maxVal * t), pad.left - 5, y + 3);
+  });
+
+  // Axe X
+  ctx.fillStyle = "#6b7280";
+  ctx.font = "9px Arial, sans-serif";
+  ctx.textAlign = "center";
+  const ticks = single ? [xMin] : Array.from({ length: 5 }, (_, i) => xMin + (i / 4) * (xMax - xMin));
+  ticks.forEach(t => {
+    const d = new Date(t);
+    ctx.fillText(`S${fmtDateFull(d).slice(0, 5)}`, xPix(t), pad.top + H + 26);
+  });
+
+  // Seuil
+  if (seuil != null) {
+    const sy = yPix(seuil);
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = "#ef4444";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(pad.left, sy); ctx.lineTo(pad.left + W, sy); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#ef4444";
+    ctx.font = "9px Arial, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(`Seuil: ${seuil}`, pad.left + 4, sy - 4);
+  }
+
+  // Couleurs distinctes proches du fichier de référence
+  const EXCEL_COLORS = ["#4472C4","#ED7D31","#A9D18E","#FF0000","#FFC000","#5B9BD5","#70AD47","#9E480E","#636363","#997300"];
+
+  series.forEach((s, si) => {
+    const valid = (s.points || []).filter(p => p.ufc != null);
+    if (!valid.length) return;
+    const color = s.color || EXCEL_COLORS[si % EXCEL_COLORS.length];
+    const pix = valid.map(p => ({ x: xPix(new Date(p.date).getTime()), y: yPix(p.ufc) }));
+
+    if (pix.length > 1) {
+      ctx.beginPath();
+      pix.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.stroke();
+    }
+
+    pix.forEach(p => {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    });
+  });
+
+  // Légende
+  const legendY = ch - 14;
+  let legendX = pad.left;
+  series.forEach((s, si) => {
+    const color = s.color || EXCEL_COLORS[si % EXCEL_COLORS.length];
+    const lbl = s.pointId || s.label || "";
+    ctx.fillStyle = color;
+    ctx.fillRect(legendX, legendY - 7, 12, 7);
+    ctx.fillStyle = "#374151";
+    ctx.font = "8px Arial, sans-serif";
+    ctx.textAlign = "left";
+    const tw = ctx.measureText(lbl).width;
+    ctx.fillText(lbl, legendX + 14, legendY);
+    legendX += tw + 24;
+    if (legendX > cw - 60) legendX = pad.left; // retour à la ligne
+  });
+}
+
+function renderEbChartExcelPng(chunk, seuil, title) {
+  return renderPngDataUrl(EB_CHART_W, EB_CHART_H, (canvas) => drawEbChartForExcel(canvas, chunk, seuil, title));
+}
+
 function buildFeuil1(wb, allFixed, allRandom, axis) {
   const ws = wb.addWorksheet("Feuil1");
   const headers = ["Sem", "Nbre Analyse", "N pts Eau", "N pts Air", "Pts Conform Surf", "N Con Eau", "Conf Air", "Taux conformité"];
@@ -382,6 +623,7 @@ function buildFeuil1(wb, allFixed, allRandom, axis) {
     const cell = ws.getCell(2, 7 + i);
     cell.value = h;
     cell.font  = { bold: true };
+    cell.fill  = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9E1F2" } };
   });
 
   const allPts = [...allFixed, ...allRandom];
@@ -389,6 +631,8 @@ function buildFeuil1(wb, allFixed, allRandom, axis) {
     seuil:  p.seuil ?? 50,
     values: weeklyValues(pointsOf(p), axis, ufcMapper),
   }));
+
+  const weekData = [];
 
   for (let w = 1; w <= axis.numWeeks; w++) {
     const row = 2 + w;
@@ -399,20 +643,45 @@ function buildFeuil1(wb, allFixed, allRandom, axis) {
       total++;
       if (v < seuil) conform++;
     }
-    ws.getCell(row, 7).value  = w;          // Sem
-    ws.getCell(row, 8).value  = total;      // Nbre Analyse (surface)
-    ws.getCell(row, 9).value  = 0;          // N pts Eau
-    ws.getCell(row, 10).value = 0;          // N pts Air
-    ws.getCell(row, 11).value = conform;    // Pts Conform Surf
-    ws.getCell(row, 12).value = 0;          // N Con Eau
-    ws.getCell(row, 13).value = 0;          // Conf Air
-    ws.getCell(row, 14).value = {
-      formula: `IFERROR(SUM(K${row}:M${row})/SUM(H${row}:J${row}),"")`,
-    };
-    ws.getCell(row, 14).numFmt = "0%";
+    if (total > 0) {
+      weekData.push({ week: w, total, conform, rate: conform / total });
+    }
+    ws.getCell(row, 7).value  = w;
+    if (total > 0) {
+      ws.getCell(row, 8).value  = total;
+      ws.getCell(row, 9).value  = 0;
+      ws.getCell(row, 10).value = 0;
+      ws.getCell(row, 11).value = conform;
+      ws.getCell(row, 12).value = 0;
+      ws.getCell(row, 13).value = 0;
+      ws.getCell(row, 14).value = {
+        formula: `IFERROR(SUM(K${row}:M${row})/SUM(H${row}:J${row}),"")`,
+      };
+      ws.getCell(row, 14).numFmt = "0%";
+      // Coloration conditionnelle manuelle pour la cellule du taux
+      if (conform / total >= 0.95) {
+        ws.getCell(row, 14).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC6EFCE" } };
+        ws.getCell(row, 14).font = { color: { argb: "FF375623" } };
+      } else if (conform / total >= 0.8) {
+        ws.getCell(row, 14).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFEB9C" } };
+        ws.getCell(row, 14).font = { color: { argb: "FF9C5700" } };
+      } else {
+        ws.getCell(row, 14).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } };
+        ws.getCell(row, 14).font = { color: { argb: "FF9C0006" } };
+      }
+    }
   }
 
   for (let c = 7; c <= 14; c++) ws.getColumn(c).width = 14;
+
+  // ── Graphique PNG : taux de conformité hebdomadaire ──────────────────────
+  if (weekData.length > 0) {
+    const CHART_W = 800, CHART_H = 300;
+    const dataUrl = renderConformityChartPng(weekData, CHART_W, CHART_H);
+    const imgId = wb.addImage({ base64: dataUrl, extension: "png" });
+    const chartStartRow = 3 + axis.numWeeks + 2;
+    ws.addImage(imgId, { tl: { col: 6, row: chartStartRow - 1 }, ext: { width: CHART_W, height: CHART_H } });
+  }
 }
 
 // ── Point d'entrée — zonesData: [{ zone:{label}, series, randomPoints, seuil }] ──
