@@ -1,0 +1,808 @@
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
+import { useComputedZones } from "../hooks/useComputedZones";
+import { usePointHistory, buildSeriesFromRaw } from "../hooks/usePointHistory";
+import { useMapDisplaySelection } from "../hooks/useMapDisplaySelection.js";
+import { useAuth } from "../context/AuthContext";
+import { labResultsAPI } from "../services/api.js";
+import { exportHistoryToDocx } from "../utils/exportHistoryDocx.js";
+import { exportHistoryToXlsx } from "../utils/exportHistoryXlsx.js";
+import TrendChart from "../components/TrendChart";
+import Icon from "../components/Icon";
+import { usePersistedFiles } from "../map/usePersistedFiles.js";
+import { usePoints } from "../context/PointsContext.jsx";
+import { assignPointColors } from "../utils/pointColors.js";
+import { isRandomPointId } from "../map/factoryData.js";
+
+function statusOf(ufc, seuil) {
+  if (ufc >= seuil)        return "critical";
+  if (ufc >= seuil * 0.8)  return "warning";
+  return "ok";
+}
+
+const STATUS_LABEL = { critical: "Critique", warning: "Surveillance", ok: "Conforme" };
+
+const DURATION_OPTIONS = [
+  { value: 1,    label: "1 jour" },
+  { value: 7,    label: "7 jours" },
+  { value: 30,   label: "30 jours" },
+  { value: 90,   label: "3 mois" },
+  { value: null, label: "Depuis le début" },
+];
+
+// Filtre les relevés d'une série (champ "points" pour les points fixes,
+// "series" pour les points aléatoires) à la fenêtre de durée choisie par
+// l'utilisateur — appliqué aussi bien à l'affichage qu'aux exports, pour que
+// le rapport téléchargé corresponde toujours à ce qui est affiché à l'écran.
+//
+// Ancré sur "aujourd'hui" (Date.now()), volontairement — PAS sur le dernier
+// relevé connu. "30 derniers jours" doit toujours désigner les 30 derniers
+// jours réels : si la surveillance s'arrête pendant 2 mois, la page doit
+// clairement se vider plutôt que de réafficher une vieille courbe comme si
+// tout était à jour. Un ancrage sur les données masquerait silencieusement
+// un arrêt de surveillance — inacceptable pour un outil de sécurité
+// alimentaire. Si une bonne raison existe de revoir un bulletin ancien, c'est
+// le rôle du réglage "Bulletin affiché sur la carte" (choix explicite), pas
+// celui de ce filtre.
+//
+// "Depuis le début" (days === null) ne change pas ce principe : pas de
+// coupure du tout, donc tout ce qui reste en base s'affiche — borné
+// naturellement par la fenêtre de rétention serveur (cf. RETENTION_DAYS,
+// routes/labResults.js), qui purge déjà les relevés au-delà de 365 jours.
+function filterSeriesByDuration(series, days, field = "points") {
+  if (days === null) return series;
+  const cutoff = Date.now() - days * 86400000;
+  return series.map((s) => ({
+    ...s,
+    [field]: (s[field] || []).filter((p) => new Date(p.date).getTime() >= cutoff),
+  }));
+}
+
+function fmtDateFull(d) {
+  const dd = new Date(d);
+  return `${String(dd.getDate()).padStart(2, "0")}/${String(dd.getMonth() + 1).padStart(2, "0")}/${dd.getFullYear()}`;
+}
+
+function StatBox({ label, value, unit, colorClass, tooltip }) {
+  return (
+    <div className="history-stat" title={tooltip}>
+      <div className="history-stat-label">{label}</div>
+      <div className={`history-stat-value${colorClass ? " " + colorClass : ""}`}>
+        {value}
+        {unit && <span className="hstat-unit"> {unit}</span>}
+      </div>
+    </div>
+  );
+}
+
+// Convertit "JJ/MM/AAAA" (format bulletin) en ISO — même logique que
+// parseReportDate côté backend, pour que la déduplication par date fonctionne.
+function parseLocalDate(str) {
+  if (!str) return null;
+  const m = String(str).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (!m) return null;
+  const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+export default function HistoryPage() {
+  const { computedZones: zones, loading } = useComputedZones();
+  const { user } = useAuth();
+  const isSuperadmin = user?.role === "superadmin";
+
+  const [selectedId, setSelectedId] = useState(null);
+  const [comparedId, setComparedId] = useState(null);
+  useEffect(() => {
+    if (zones.length && !selectedId) setSelectedId(zones[0].id);
+  }, [zones, selectedId]);
+  const zone = useMemo(() => zones.find((z) => z.id === selectedId) || zones[0] || null, [zones, selectedId]);
+  const comparedZone = useMemo(() => comparedId ? zones.find(z => z.id === comparedId) ?? null : null, [zones, comparedId]);
+
+  // Courbes par point (Phase 1) + points aléatoires distincts (Phase 2), réelles depuis le backend
+  const { series: rawSeries, randomPoints: rawRandomPoints, loading: histLoading, error: histError, reload: reloadHistory } = usePointHistory(zone?.mapId);
+  const { series: rawComparedSeries } = usePointHistory(comparedZone?.mapId ?? null);
+
+  // Bulletin affiché (cf. AdminPage, onglet "Bulletin sur la carte") — "partout
+  // sur l'écran", donc aussi ici. Quand un bulletin précis est choisi, on
+  // n'affiche que SES points (mais leur historique complet, pas un seul
+  // relevé) — et le filtre de durée n'a alors plus de sens (un bulletin
+  // ancien choisi exprès serait sinon masqué par la fenêtre récente) : il
+  // est ignoré tant que le choix n'est pas "Automatique".
+  const { allowedIds } = useMapDisplaySelection();
+
+  // ── Source locale : bulletins importés hors-ligne (localStorage) ─────────
+  // Complète les données backend pour les bulletins importés sans serveur actif.
+  const { fileEntries, fileResults } = usePersistedFiles();
+  const { pointsByZone: allPointsByZone } = usePoints();
+
+  const localSeries = useMemo(() => {
+    if (!zone || !allPointsByZone) return [];
+    const zonePointIds = new Set((allPointsByZone[zone.mapId] || []).map(p => p.id));
+    if (zonePointIds.size === 0) return [];
+
+    const byPoint = new Map(); // pointId → Map<dateKey, mesure>
+    for (const fileEntry of fileEntries) {
+      const results = fileResults[fileEntry.id] || [];
+      const bulletinByPoint = {};
+      for (const r of results) {
+        if (!zonePointIds.has(r.pointId)) continue;
+        if (!bulletinByPoint[r.pointId]) bulletinByPoint[r.pointId] = { dateStr: r.date || fileEntry.date };
+        const e = bulletinByPoint[r.pointId];
+        if (r.parameter === "salmonelles")      e.salmonella  = r.detected ?? null;
+        else if (r.parameter === "cronobacter") e.cronobacter = r.detected ?? null;
+        else if (r.numericValue !== undefined && r.numericValue !== null) e.ufc = r.numericValue;
+        if (r.date && !e.dateStr) e.dateStr = r.date;
+      }
+      for (const [pointId, entry] of Object.entries(bulletinByPoint)) {
+        if (!byPoint.has(pointId)) byPoint.set(pointId, new Map());
+        const isoDate = parseLocalDate(entry.dateStr);
+        if (!isoDate) continue;
+        const dateKey = isoDate.substring(0, 10);
+        if (!byPoint.get(pointId).has(dateKey)) {
+          byPoint.get(pointId).set(dateKey, {
+            ufc: entry.ufc ?? null, salmonella: entry.salmonella ?? null,
+            cronobacter: entry.cronobacter ?? null, date: isoDate,
+          });
+        }
+      }
+    }
+    const ids = [...byPoint.keys()].filter(id => !isRandomPointId(id));
+    const colorMap = assignPointColors(ids);
+    return ids.map(pointId => ({
+      pointId, label: pointId, description: "", color: colorMap.get(pointId),
+      points: [...byPoint.get(pointId).values()].sort((a, b) => new Date(a.date) - new Date(b.date)),
+    }));
+  }, [zone, allPointsByZone, fileEntries, fileResults]);
+
+  // Fusion backend + local : backend prioritaire, local comble les trous.
+  const mergedRawSeries = useMemo(() => {
+    if (!localSeries.length) return rawSeries;
+    const resultMap = new Map(rawSeries.map(s => [s.pointId, { ...s, points: [...(s.points || [])] }]));
+    for (const ls of localSeries) {
+      if (!resultMap.has(ls.pointId)) {
+        resultMap.set(ls.pointId, ls);
+      } else {
+        const existing = resultMap.get(ls.pointId);
+        const backendDates = new Set(existing.points.map(p => new Date(p.date).toISOString().substring(0, 10)));
+        const newPts = (ls.points || []).filter(p => !backendDates.has(new Date(p.date).toISOString().substring(0, 10)));
+        if (newPts.length > 0) {
+          existing.points = [...existing.points, ...newPts].sort((a, b) => new Date(a.date) - new Date(b.date));
+        }
+      }
+    }
+    return [...resultMap.values()];
+  }, [rawSeries, localSeries]);
+
+  const seriesInBulletin       = useMemo(() => allowedIds ? mergedRawSeries.filter((s) => allowedIds.has(s.pointId)) : mergedRawSeries, [mergedRawSeries, allowedIds]);
+  const randomPointsInBulletin = useMemo(() => allowedIds ? rawRandomPoints.filter((s) => allowedIds.has(s.pointId)) : rawRandomPoints, [rawRandomPoints, allowedIds]);
+
+  // Fenêtre de durée affichée (et exportée) — 1 jour / 7 jours / 30 jours / 3 mois /
+  // depuis le début (null = pas de coupure, cf. filterSeriesByDuration).
+  const [durationDays, setDurationDays] = useState(null);
+  const series = useMemo(
+    () => allowedIds ? seriesInBulletin : filterSeriesByDuration(seriesInBulletin, durationDays, "points"),
+    [seriesInBulletin, durationDays, allowedIds]
+  );
+  const randomPoints = useMemo(
+    () => (allowedIds ? randomPointsInBulletin : filterSeriesByDuration(randomPointsInBulletin, durationDays, "series")).filter((rp) => rp.series.length > 0),
+    [randomPointsInBulletin, durationDays, allowedIds]
+  );
+
+  // Checkboxes de visibilité par point — toutes cochées par défaut, réinitialisées au changement de zone
+  const [hiddenIds, setHiddenIds] = useState(() => new Set());
+  const [showImports, setShowImports] = useState(false);
+  const [tablePage, setTablePage] = useState(1);
+  const ROWS_PER_PAGE = 25;
+  const chartRef = useRef(null);
+  useEffect(() => { setHiddenIds(new Set()); setTablePage(1); }, [zone?.mapId]);
+  const togglePoint = (pointId) => setHiddenIds((prev) => {
+    const next = new Set(prev);
+    if (next.has(pointId)) next.delete(pointId); else next.add(pointId);
+    return next;
+  });
+  const visibleSeries = useMemo(() => series.filter((s) => !hiddenIds.has(s.pointId)), [series, hiddenIds]);
+  const comparedSeries = useMemo(() => {
+    if (!comparedZone || !rawComparedSeries.length) return [];
+    const cs = allowedIds
+      ? rawComparedSeries.filter(s => allowedIds.has(s.pointId))
+      : filterSeriesByDuration(rawComparedSeries, durationDays, "points");
+    return cs.map(s => ({ ...s, dashed: true, label: `${s.label || s.pointId} (${comparedZone.label})` }));
+  }, [comparedZone, rawComparedSeries, allowedIds, durationDays]);
+
+  const seuil = zone?.worstSeuil ?? zone?.seuil ?? 50;
+
+  // Tous les relevés réels de la zone (tous points confondus), triés chronologiquement
+  const allPointsFlat = useMemo(() => {
+    return series
+      .flatMap((s) => (s.points || []).map((p) => ({
+        ...p, pointId: s.pointId, label: s.label, seuil,
+      })))
+      .filter((p) => p.ufc !== null && p.ufc !== undefined)
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+  }, [series, seuil]);
+
+  const stats = useMemo(() => {
+    if (!allPointsFlat.length) return null;
+    const values = allPointsFlat.map((p) => p.ufc);
+    const n   = values.length;
+    const avg = Math.round(values.reduce((s, v) => s + v, 0) / n);
+    const max = Math.max(...values);
+    const min = Math.min(...values);
+    let slope = 0;
+    if (n >= 2) {
+      const times  = allPointsFlat.map(p => new Date(p.date).getTime());
+      const tMean  = times.reduce((s, t) => s + t, 0) / n;
+      const num    = times.reduce((acc, t, i) => acc + (t - tMean) * (values[i] - avg), 0);
+      const den    = times.reduce((acc, t)    => acc + (t - tMean) ** 2, 0);
+      if (den !== 0) slope = Math.round((num / den) * 86400000 * 10) / 10;
+    }
+    const confRate = Math.round(allPointsFlat.filter(p => p.ufc < p.seuil).length / n * 100);
+    return { avg, max, min, slope, confRate };
+  }, [allPointsFlat]);
+
+  // ── Journal des imports (annulation superadmin) ─────────────
+  const [imports, setImports] = useState([]);
+  const [importsLoading, setImportsLoading] = useState(false);
+
+  const loadImports = useCallback(async () => {
+    setImportsLoading(true);
+    try {
+      setImports(await labResultsAPI.listImports());
+    } catch (err) {
+      console.error("Erreur chargement journal des imports:", err);
+    } finally {
+      setImportsLoading(false);
+    }
+  }, []);
+  useEffect(() => { loadImports(); }, [loadImports]);
+
+  const handleUndo = async (importId) => {
+    if (!window.confirm(
+      "Annuler cet import ? Les valeurs seront restaurées à leur état précédent, sauf pour les points qu'un import plus récent a déjà légitimement modifiés."
+    )) return;
+    try {
+      await labResultsAPI.undoImport(importId);
+      await Promise.all([loadImports(), reloadHistory()]);
+    } catch (err) {
+      alert(err.message || "Erreur lors de l'annulation de l'import.");
+    }
+  };
+
+  const handleDelete = async (importId) => {
+    if (!window.confirm(
+      "Supprimer complètement cet import ? Contrairement à l'annulation, cette action efface aussi l'historique réel de cet import — c'est comme si ce bulletin n'avait jamais été importé. Aucune restauration possible ensuite."
+    )) return;
+    try {
+      await labResultsAPI.deleteImport(importId);
+      await Promise.all([loadImports(), reloadHistory()]);
+    } catch (err) {
+      alert(err.message || "Erreur lors de la suppression de l'import.");
+    }
+  };
+
+  // ── Bandeau de rétention 30 jours (Phase 3) ─────────────────
+  const [retention, setRetention] = useState(null);
+  useEffect(() => {
+    labResultsAPI.getRetentionStatus().then(setRetention).catch(() => setRetention(null));
+  }, [series, imports]);
+
+  // ── Exports ──────────────────────────────────────────────────
+  const handleExportCSV = () => {
+    if (!zone || !allPointsFlat.length) return;
+
+    // En-têtes enrichis pour une meilleure lisibilité analytique
+    const headers = [
+      "Date", "Point de prélèvement", "UFC/cm²", "Seuil réglementaire",
+      "Statut", "Marge vs seuil", "% seuil utilisé",
+      "Salmonelles", "Cronobacter"
+    ];
+
+    const rows = allPointsFlat.map((h) => {
+      const st     = statusOf(h.ufc, h.seuil);
+      const marge  = h.seuil - h.ufc;
+      const pctSeuil = Math.round((h.ufc / h.seuil) * 100);
+      return [
+        fmtDateFull(h.date),
+        h.pointId,
+        h.ufc,
+        h.seuil,
+        STATUS_LABEL[st],
+        (marge > 0 ? "+" : "") + marge,
+        pctSeuil + "%",
+        h.salmonella === true ? "Détectées" : h.salmonella === false ? "Absentes" : "—",
+        h.cronobacter === true ? "Détecté" : h.cronobacter === false ? "Absent" : "—",
+      ];
+    });
+
+    // Bloc de synthèse en bas du CSV
+    const values = allPointsFlat.map((p) => p.ufc);
+    const avg    = values.length ? Math.round(values.reduce((a, b) => a + b, 0) / values.length) : 0;
+    const max    = values.length ? Math.max(...values) : 0;
+    const min    = values.length ? Math.min(...values) : 0;
+    const confCount = allPointsFlat.filter(p => p.ufc < p.seuil).length;
+    const confRate  = values.length ? Math.round((confCount / values.length) * 100) : 0;
+
+    const summary = [
+      [],
+      ["SYNTHÈSE", "", "", "", "", "", "", "", ""],
+      ["Zone analysée", zone.label],
+      ["Nombre de relevés", values.length],
+      ["Moyenne UFC/cm²", avg],
+      ["Maximum UFC/cm²", max],
+      ["Minimum UFC/cm²", min],
+      ["Taux de conformité", confRate + "%"],
+      ["Relevés conformes", confCount],
+      ["Relevés non conformes", values.length - confCount],
+    ];
+
+    const allRows = [headers, ...rows, ...summary];
+    const csv  = allRows.map((r) => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = `innofaso_${zone.label.replace(/\s+/g, "_")}_analyse_detaillee.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const [exporting, setExporting] = useState(false);
+
+  const buildAllZonesData = async () => {
+    const zonesData = [];
+    for (const z of zones) {
+      const raw = await labResultsAPI.getPointHistory(z.mapId);
+      const { series: rawS, randomPoints: rawRp } = buildSeriesFromRaw(raw);
+      // Même règles que l'écran : un bulletin précis choisi ("Bulletin sur la
+      // carte") restreint aux points qu'il a rapportés et ignore le filtre de
+      // durée ; sinon, même fenêtre de durée que celle affichée à l'écran
+      // (ancrée sur aujourd'hui), pour que le rapport téléchargé corresponde
+      // toujours à ce que l'admin a sous les yeux.
+      const inBulletinS  = allowedIds ? rawS.filter((x) => allowedIds.has(x.pointId)) : rawS;
+      const inBulletinRp = allowedIds ? rawRp.filter((x) => allowedIds.has(x.pointId)) : rawRp;
+      const s  = allowedIds ? inBulletinS : filterSeriesByDuration(inBulletinS, durationDays, "points");
+      const rp = (allowedIds ? inBulletinRp : filterSeriesByDuration(inBulletinRp, durationDays, "series")).filter((r) => r.series.length > 0);
+      const zoneSeuil = z.worstSeuil ?? z.seuil ?? 50;
+      // Le seuil est désormais le même pour tous les points d'une zone — on
+      // l'attache à chaque point pour les exports qui regroupent autrement
+      // que par zone (ex. l'Excel, qui regroupe par Environnement).
+      const seuiled = (arr) => arr.map((p) => ({ ...p, seuil: zoneSeuil }));
+      zonesData.push({ zone: { label: z.label }, series: seuiled(s), randomPoints: seuiled(rp), seuil: zoneSeuil });
+    }
+    return zonesData;
+  };
+
+  const handleExportWord = async () => {
+    setExporting(true);
+    try {
+      await exportHistoryToDocx(await buildAllZonesData());
+    } catch (err) {
+      console.error("Erreur export Word:", err);
+      alert("Erreur lors de la génération du rapport Word.");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const [exportingXlsx, setExportingXlsx] = useState(false);
+  const handleExportExcel = async () => {
+    setExportingXlsx(true);
+    try {
+      await exportHistoryToXlsx(await buildAllZonesData());
+    } catch (err) {
+      console.error("Erreur export Excel:", err);
+      alert("Erreur lors de la génération du rapport Excel.");
+    } finally {
+      setExportingXlsx(false);
+    }
+  };
+
+  if (loading) return (
+    <div className="dash-loading">
+      <div className="spinner" />
+      Chargement de l'historique…
+    </div>
+  );
+
+  return (
+    <div className="history-page">
+      <div className="history-page-header">
+        <div>
+          <div className="page-title">Historique des contrôles</div>
+          <div className="page-sub">
+            Courbe réelle par point de prélèvement (entérobactéries), fenêtre glissante (cf. bandeau de rétention)
+          </div>
+        </div>
+        <div className="history-export-group">
+          <button
+            className="history-export-btn"
+            style={{ background: '#5c5852', color: '#fff', borderColor: '#5c5852' }}
+            onClick={handleExportExcel} disabled={exportingXlsx}
+          >
+            <Icon name="download" size={14} strokeWidth={2} />
+            {exportingXlsx ? "En cours…" : "Excel (toutes zones)"}
+          </button>
+          <button
+            className="history-export-btn"
+            style={{ background: '#5c5852', color: '#fff', borderColor: '#5c5852' }}
+            onClick={handleExportWord} disabled={exporting}
+          >
+            <Icon name="download" size={14} strokeWidth={2} />
+            {exporting ? "En cours…" : "Word (toutes zones)"}
+          </button>
+          <button className="history-export-btn" onClick={handleExportCSV} disabled={!zone || !allPointsFlat.length}>
+            <Icon name="download" size={14} strokeWidth={2} />
+            CSV – Analyse détaillée (zone)
+          </button>
+        </div>
+      </div>
+
+      {retention && retention.daysUntilDrop !== null && retention.needsExportSoon && (
+        <div className={`history-retention-banner${retention.daysUntilDrop <= 2 ? " urgent" : ""}`}>
+          <span>
+            ⏳ {retention.daysUntilDrop <= 0
+              ? "Des relevés sortent dès maintenant de la fenêtre de rétention."
+              : `Les relevés les plus anciens seront retirés de l'historique dans ${retention.daysUntilDrop} jour${retention.daysUntilDrop > 1 ? "s" : ""}.`}
+            {" "}Exportez le rapport avant cette échéance.
+          </span>
+          <button className="history-export-btn" onClick={handleExportWord} disabled={exporting}>
+            {exporting ? "Export en cours…" : "Exporter maintenant"}
+          </button>
+        </div>
+      )}
+
+      <div className="history-controls">
+        <select
+          className="history-zone-select"
+          value={zone?.id || ""}
+          onChange={(e) => setSelectedId(e.target.value)}
+        >
+          <option value="" disabled>— Sélectionner une zone —</option>
+          {zones.map((z) => (
+            <option key={z.id} value={z.id}>{z.label}</option>
+          ))}
+        </select>
+
+        <select
+          className="history-zone-select"
+          value={comparedId || ""}
+          onChange={(e) => setComparedId(e.target.value || null)}
+          title="Superposer une deuxième zone (courbes tiretées)"
+          style={{ maxWidth: 220, color: comparedId ? 'var(--txt)' : 'var(--txt3)' }}
+        >
+          <option value="">— Comparer avec —</option>
+          {zones.filter(z => z.id !== zone?.id).map((z) => (
+            <option key={z.id} value={z.id}>{z.label}</option>
+          ))}
+        </select>
+
+        <div className="history-duration-group" title={allowedIds ? "Filtre de durée ignoré tant qu'un bulletin précis est choisi" : undefined}>
+          {DURATION_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              className={`history-duration-btn${durationDays === opt.value ? " history-duration-btn--active" : ""}`}
+              disabled={!!allowedIds}
+              onClick={() => setDurationDays(opt.value)}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {allowedIds && (
+        <div className="pts-notice pts-notice--warning" style={{ marginBottom: 12 }}>
+          <span>⚠️ Un bulletin précis est choisi comme affichage ("Bulletin sur la carte", dans Administration) — seuls ses points apparaissent ici, et le filtre de durée est ignoré. Repassez en "Automatique" pour revenir à l'affichage normal.</span>
+        </div>
+      )}
+
+      {!zone ? (
+        <div className="dash-loading">Aucune zone disponible.</div>
+      ) : histLoading ? (
+        <div className="dash-loading"><div className="spinner" />Chargement…</div>
+      ) : (histError && series.length === 0 && randomPoints.length === 0) ? (
+        <div className="panel" style={{ padding: "44px 24px", textAlign: "center" }}>
+          <div style={{ fontSize: 14, fontWeight: 800, color: "#991b1b", marginBottom: 8 }}>
+            ⛔ Impossible de charger l'historique
+          </div>
+          <div style={{ fontSize: 12.5, color: "var(--txt3)", lineHeight: 1.7, maxWidth: 480, margin: "0 auto" }}>
+            Le serveur backend n'est pas accessible (port 4000). Vérifiez qu'il est lancé, puis rechargez la page.
+            Aucun bulletin local n'est disponible pour cette zone non plus.
+          </div>
+          <button
+            onClick={reloadHistory}
+            style={{ marginTop: 14, padding: "7px 18px", borderRadius: 8, border: "1px solid #e2e8f0",
+              background: "#f8fafc", color: "#334155", fontSize: 13, cursor: "pointer", fontWeight: 600 }}
+          >
+            Réessayer
+          </button>
+        </div>
+      ) : series.length === 0 && randomPoints.length === 0 ? (
+        <div className="panel" style={{ padding: "44px 24px", textAlign: "center" }}>
+          <div style={{ fontSize: 14, fontWeight: 800, color: "var(--txt)", marginBottom: 8 }}>
+            Aucun relevé pour « {zone.label} » {durationDays === null
+              ? "depuis le début"
+              : `sur ${DURATION_OPTIONS.find((o) => o.value === durationDays)?.label}`}
+          </div>
+          <div style={{ fontSize: 12.5, color: "var(--txt3)", lineHeight: 1.7, maxWidth: 480, margin: "0 auto" }}>
+            {imports.filter(i => i.status !== "annule").length > 0 ? (
+              <>
+                Des bulletins ont été importés (voir le journal ci-dessous), mais aucun point
+                de <strong>{zone.label}</strong> n'apparaît dans ces bulletins.
+              </>
+            ) : (
+              <>
+                Aucun bulletin importé. Importez un bulletin depuis la page Cartographie
+                pour commencer le suivi de l'historique.
+              </>
+            )}
+          </div>
+        </div>
+      ) : (
+        <>
+          {histError && (
+            <div className="pts-notice pts-notice--warning" style={{ marginBottom: 12 }}>
+              <span>⚠ Serveur non disponible — historique partiel (données locales uniquement). Relancez le backend pour voir l'historique complet.</span>
+              <button onClick={reloadHistory} style={{ marginLeft: 8, padding: "4px 10px", borderRadius: 7, border: "1px solid #92400e", background: "transparent", color: "#92400e", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>Réessayer</button>
+            </div>
+          )}
+          {/* Stats */}
+          <div className="history-stats" style={{ gridTemplateColumns: "repeat(5, 1fr)" }}>
+            <StatBox
+              label="Moyenne"
+              value={stats?.avg ?? "—"}
+              unit="UFC/cm²"
+              colorClass={stats?.avg >= seuil ? "red" : stats?.avg >= seuil * 0.8 ? "orange" : ""}
+              tooltip="Moyenne de tous les relevés de cette zone sur la période affichée."
+            />
+            <StatBox
+              label="Maximum"
+              value={stats?.max ?? "—"}
+              unit="UFC/cm²"
+              colorClass={stats?.max >= seuil ? "red" : ""}
+              tooltip="La pire valeur relevée sur la période."
+            />
+            <StatBox
+              label="Minimum"
+              value={stats?.min ?? "—"}
+              unit="UFC/cm²"
+              colorClass=""
+              tooltip="La meilleure valeur relevée sur la période."
+            />
+            <StatBox
+              label="Tendance"
+              value={stats
+                ? (stats.slope > 0 ? "+" : "") + Math.abs(stats.slope)
+                : "—"}
+              unit="UFC/j"
+              colorClass={stats?.slope > 0 ? "red" : stats?.slope < 0 ? "green" : ""}
+              tooltip="Pente de régression linéaire sur la période (UFC/cm² par jour). Un + indique une contamination croissante, un – une amélioration. Plus fiable que la simple différence premier/dernier relevé."
+            />
+            <StatBox
+              label="Conformité"
+              value={stats?.confRate ?? "—"}
+              unit="%"
+              colorClass={!stats ? "" : stats.confRate >= 90 ? "green" : stats.confRate >= 70 ? "orange" : "red"}
+              tooltip="Pourcentage de mesures dans les limites réglementaires (UFC < seuil) sur la période affichée."
+            />
+          </div>
+
+          {/* Graphique multi-points */}
+          <div className="panel history-chart-panel">
+            <div className="panel-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>
+                {zone.label} — Évolution UFC/cm² par point
+                {comparedZone && (
+                  <span style={{ fontWeight: 400, color: 'var(--txt3)', fontSize: 11, marginLeft: 10 }}>
+                    vs {comparedZone.label} (tireté)
+                  </span>
+                )}
+              </span>
+              {allPointsFlat.length > 0 && (
+                <button
+                  className="history-export-btn"
+                  style={{ marginLeft: 'auto', fontSize: 11 }}
+                  onClick={() => {
+                    const dataUrl = chartRef.current?.getDataUrl();
+                    if (!dataUrl) return;
+                    const a = document.createElement('a');
+                    a.href = dataUrl;
+                    a.download = `${zone.label.replace(/\s+/g, '_')}_graphique.png`;
+                    a.click();
+                  }}
+                >
+                  <Icon name="download" size={12} strokeWidth={2} />
+                  PNG
+                </button>
+              )}
+            </div>
+            {series.length > 0 && (
+              <div className="history-legend">
+                {series.map((s) => (
+                  <label key={s.pointId} className="history-legend-item">
+                    <input
+                      type="checkbox"
+                      checked={!hiddenIds.has(s.pointId)}
+                      onChange={() => togglePoint(s.pointId)}
+                    />
+                    <span className="history-legend-swatch" style={{ background: s.color }} />
+                    {s.pointId}
+                  </label>
+                ))}
+              </div>
+            )}
+            <div className="history-chart-wrap">
+              {allPointsFlat.length === 0 && series.length > 0 ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 8 }}>
+                  <div style={{ fontSize: 13, color: 'var(--txt3)', textAlign: 'center' }}>
+                    Des relevés existent mais tombent hors de la fenêtre sélectionnée.
+                  </div>
+                  <button
+                    style={{ fontSize: 12, padding: '5px 14px', borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg2)', color: 'var(--txt2)', cursor: 'pointer' }}
+                    onClick={() => setDurationDays(null)}
+                  >
+                    Afficher depuis le début
+                  </button>
+                </div>
+              ) : (
+                <TrendChart ref={chartRef} series={[...visibleSeries, ...comparedSeries]} seuil={seuil} />
+              )}
+            </div>
+          </div>
+
+          {/* Points aléatoires — affichage distinct, jamais de courbe */}
+          {randomPoints.length > 0 && (
+            <div className="panel history-random-panel">
+              <div className="history-random-panel-title">
+                Points aléatoires mesurés sur cette période ({randomPoints.length})
+              </div>
+              <div className="history-random-chips">
+                {randomPoints.map((rp) => {
+                  const last      = rp.series[rp.series.length - 1];
+                  const hasSalmo  = rp.series.some((s) => s.salmonella === true);
+                  const hasCrono  = rp.series.some((s) => s.cronobacter === true);
+                  return (
+                    <span key={rp.pointId} className={`history-random-chip${(hasSalmo || hasCrono) ? " has-salmonella" : ""}`}>
+                      <span className="hrc-id">{rp.pointId}</span>
+                      {last ? `${last.ufc} UFC/cm² · ${fmtDateFull(last.date)}` : "—"}
+                      {hasSalmo && " · ⚠ Salmonelles"}
+                      {hasCrono && " · ⚠ Cronobacter"}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Tableau détaillé avec pagination */}
+          <div className="panel">
+            <div className="panel-header">
+              Relevés ({allPointsFlat.length})
+              <span className="panel-header-sub">Seuil : {seuil} UFC/cm²</span>
+            </div>
+            <div className="history-table-wrap">
+              <table className="history-table">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Point</th>
+                    <th>UFC/cm²</th>
+                    <th>Seuil</th>
+                    <th>Statut</th>
+                    <th>Marge</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {allPointsFlat.slice().reverse()
+                    .slice((tablePage - 1) * ROWS_PER_PAGE, tablePage * ROWS_PER_PAGE)
+                    .map((h, i) => {
+                      const st    = statusOf(h.ufc, h.seuil);
+                      const marge = h.seuil - h.ufc;
+                      return (
+                        <tr key={`${h.pointId}-${h.date}-${i}`} className={i % 2 === 0 ? "row-even" : ""}>
+                          <td className="td-date">{fmtDateFull(h.date)}</td>
+                          <td className="mono txt3">{h.pointId}</td>
+                          <td className={`mono ${st === "critical" ? "red" : st === "warning" ? "orange" : ""}`}>
+                            {h.ufc}
+                          </td>
+                          <td className="mono txt3">{h.seuil}</td>
+                          <td><span className={`status-badge ${st}`}>{STATUS_LABEL[st]}</span></td>
+                          <td className={`mono ${marge < 0 ? "red" : marge < h.seuil * 0.2 ? "orange" : "green"}`}>
+                            {marge > 0 ? "+" : ""}{marge}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                </tbody>
+              </table>
+            </div>
+            {allPointsFlat.length > ROWS_PER_PAGE && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, padding: '10px 0', borderTop: '1px solid var(--border)', fontSize: 13 }}>
+                <button
+                  disabled={tablePage === 1}
+                  onClick={() => setTablePage(p => p - 1)}
+                  style={{ padding: '4px 12px', borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg2)', color: tablePage === 1 ? 'var(--txt3)' : 'var(--txt)', cursor: tablePage === 1 ? 'default' : 'pointer', fontWeight: 600 }}
+                >
+                  ← Précédent
+                </button>
+                <span style={{ color: 'var(--txt3)', minWidth: 100, textAlign: 'center' }}>
+                  Page {tablePage} / {Math.ceil(allPointsFlat.length / ROWS_PER_PAGE)}
+                </span>
+                <button
+                  disabled={tablePage >= Math.ceil(allPointsFlat.length / ROWS_PER_PAGE)}
+                  onClick={() => setTablePage(p => p + 1)}
+                  style={{ padding: '4px 12px', borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg2)', color: tablePage >= Math.ceil(allPointsFlat.length / ROWS_PER_PAGE) ? 'var(--txt3)' : 'var(--txt)', cursor: tablePage >= Math.ceil(allPointsFlat.length / ROWS_PER_PAGE) ? 'default' : 'pointer', fontWeight: 600 }}
+                >
+                  Suivant →
+                </button>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* Journal des imports */}
+      <div className="panel">
+        <div
+          className="panel-header"
+          onClick={() => setShowImports(v => !v)}
+          style={{ cursor: 'pointer', userSelect: 'none', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+        >
+          <span>Journal des imports{importsLoading ? " — chargement…" : ""} ({imports.length})</span>
+          <span style={{ fontSize: 11, color: 'var(--txt3)', marginLeft: 8 }}>{showImports ? '▲ Masquer' : '▼ Afficher'}</span>
+        </div>
+        {showImports && <div className="history-table-wrap">
+          <table className="history-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Fichier</th>
+                <th>Par</th>
+                <th>Résultats</th>
+                <th>Statut</th>
+                {isSuperadmin && <th></th>}
+              </tr>
+            </thead>
+            <tbody>
+              {imports.map((imp, i) => (
+                <tr
+                  key={imp.id}
+                  className={`${i % 2 === 0 ? "row-even" : ""}${imp.status === "annule" ? " history-imports-row cancelled" : ""}`}
+                >
+                  <td className="td-date">{fmtDateFull(imp.imported_at)}</td>
+                  <td>{imp.filename}</td>
+                  <td className="txt3">{imp.imported_by}</td>
+                  <td className="mono txt3">{imp.result_count}</td>
+                  <td>
+                    {imp.status === "annule"
+                      ? <span className="status-badge critical">Annulé{imp.cancelled_by ? ` · ${imp.cancelled_by}` : ""}</span>
+                      : <span className="status-badge ok">Actif</span>}
+                  </td>
+                  {isSuperadmin && (
+                    <td>
+                      {imp.status !== "annule" ? (
+                        <button className="history-undo-btn" onClick={() => handleUndo(imp.id)}>
+                          Annuler cet import
+                        </button>
+                      ) : (
+                        <button className="history-undo-btn history-delete-btn" onClick={() => handleDelete(imp.id)}>
+                          Supprimer complètement
+                        </button>
+                      )}
+                    </td>
+                  )}
+                </tr>
+              ))}
+              {imports.length === 0 && !importsLoading && (
+                <tr>
+                  <td colSpan={isSuperadmin ? 6 : 5} className="txt3" style={{ textAlign: "center", padding: 20 }}>
+                    Aucun import enregistré.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>}
+      </div>
+    </div>
+  );
+}
